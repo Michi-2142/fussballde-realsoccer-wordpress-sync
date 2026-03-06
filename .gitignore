@@ -1,0 +1,24 @@
+# Theme (commercial, do not publish)
+realsoccer/
+
+# macOS
+.DS_Store
+._*
+
+# IDEs
+.idea/
+.vscode/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+
+# Archives
+*.zip
+*.tar.gz
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.*
