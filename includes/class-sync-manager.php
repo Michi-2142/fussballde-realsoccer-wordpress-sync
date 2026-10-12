@@ -33,6 +33,12 @@ class Fussball_Sync_Manager {
     /** @var string  result_category taxonomy slug for friendly games (competition contains "Freundschaftsspiel"). */
     private $friendly_category;
 
+    /** @var string  First day of the current season (Y-m-d). Empty = no lower bound. */
+    private $season_start;
+
+    /** @var string  Last day of the current season (Y-m-d). Empty = no upper bound. */
+    private $season_end;
+
     /**
      * Lazy-built cache: normalised_team_name => ['value'=>string, 'source'=>string].
      * Built once per sync run from all existing fixture_and_result posts.
@@ -41,13 +47,51 @@ class Fussball_Sync_Manager {
      */
     private $team_flag_cache = null;
 
+    /** @var bool  Trockenlauf: alles loggen, nichts schreiben. */
+    private $dry = false;
+
+    /** @var array  Beitrags-IDs, die in diesem Lauf einem fussball.de-Spiel zugeordnet wurden (für die Waisen-Bereinigung). */
+    private $matched = array();
+
+    /** @var array|null  Cache Datum|Heim-Schlüssel|Gast-Schlüssel => Beitrags-ID (Fallback-Suche ohne Kennung). */
+    private $key_cache = null;
+
+    /** @var array  Kategorien (Slugs) der anderen konfigurierten Mannschaften: deren Beiträge fasst dieser Lauf nie an. */
+    private $other_cats = array();
+
+    public function set_dry_run( $on ) { $this->dry = (bool) $on; }
+
     /**
      * @param string $category           Taxonomy slug for regular matches (empty = no assignment).
      * @param string $friendly_category  Taxonomy slug for friendly games (empty = use $category).
+     * @param string $season_start       First day of the season, Y-m-d (empty = no lower bound).
+     * @param string $season_end         Last day of the season, Y-m-d (empty = no upper bound).
      */
-    public function __construct( $category = '', $friendly_category = '' ) {
+    public function __construct( $category = '', $friendly_category = '', $season_start = '', $season_end = '' ) {
         $this->category          = sanitize_text_field( $category );
         $this->friendly_category = sanitize_text_field( $friendly_category );
+        $this->season_start      = sanitize_text_field( $season_start );
+        $this->season_end        = sanitize_text_field( $season_end );
+
+        // Kategorien der anderen Mannschaften (ein Freundschaftsspiel 1. Mannschaft gegen SGM hat bei beiden dieselbe
+        // fussball.de-Kennung und denselben Datum|Heim|Gast-Schlüssel; es darf weder zugeordnet noch als Dublette gelten).
+        if ( function_exists( 'fussball_sync_get_teams' ) ) {
+            $own = array_filter( array( $this->category, $this->friendly_category ) );
+            foreach ( fussball_sync_get_teams( false ) as $t ) {
+                foreach ( array( $t['category'] ?? '', $t['friendly_category'] ?? '' ) as $c ) {
+                    $c = sanitize_text_field( (string) $c );
+                    if ( '' !== $c && ! in_array( $c, $own, true ) ) { $this->other_cats[ $c ] = $c; }
+                }
+            }
+        }
+    }
+
+    /** Abfrage auf Beiträge beschränken, die nicht zu einer anderen Mannschaft gehören. */
+    private function scope_query( array $args ) {
+        if ( $this->other_cats ) {
+            $args['tax_query'] = array( array( 'taxonomy' => 'result_category', 'field' => 'slug', 'terms' => array_values( $this->other_cats ), 'operator' => 'NOT IN' ) );
+        }
+        return $args;
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -58,17 +102,34 @@ class Fussball_Sync_Manager {
      * Process all matches, generate verbose logs, and return stats.
      *
      * @param array $matches  Array of match data from Fussball_Parser.
-     * @return array  ['created'=>int, 'updated_score'=>int, 'updated_details'=>int, 'skipped'=>int, 'cancelled'=>int]
+     * @return array  ['created'=>int, 'updated_score'=>int, 'updated_details'=>int, 'skipped'=>int, 'cancelled'=>int, 'out_of_season'=>int, 'duplicates_removed'=>int]
      */
-    public function sync_matches( array $matches ) {
+    public function sync_matches( array $matches, array $counts = array() ) {
         $stats = array(
             'created'            => 0,
             'updated_score'      => 0,
             'updated_details'    => 0,
             'skipped'            => 0,
             'cancelled'          => 0,
+            'out_of_season'      => 0,
+            'ids_migrated'       => 0,
             'duplicates_removed' => 0,
+            'orphans_removed'    => 0,
         );
+        $this->matched      = array();
+        $this->key_cache    = null;
+        $this->ids_migrated = 0;
+        if ( $this->dry ) {
+            fussball_sync_log( '── DRY RUN: es wird nichts geschrieben ──' );
+        }
+
+        if ( ! empty( $this->season_start ) || ! empty( $this->season_end ) ) {
+            fussball_sync_log( sprintf(
+                'Season filter active: %s – %s (matches outside this range are ignored).',
+                $this->season_start ?: '…',
+                $this->season_end   ?: '…'
+            ) );
+        }
 
         // ── 1. Log everything that was parsed  ────────────────────────────
         fussball_sync_log( sprintf( '── Parsed %d matches from fussball.de ──', count( $matches ) ) );
@@ -90,12 +151,19 @@ class Fussball_Sync_Manager {
             }
         }
 
+        $stats['ids_migrated'] = $this->ids_migrated;
+
         // ── 3. Deduplicate: remove posts with same date + home + away ─────
-        $duplicates_removed = $this->remove_duplicates();
-        $stats['duplicates_removed'] = $duplicates_removed;
+        $stats['duplicates_removed'] = $this->remove_duplicates();
+
+        // ── 4. Waisen: Spiele dieser Kategorien, die fussball.de nicht mehr liefert und die kein Ergebnis haben ──
+        $stats['orphans_removed'] = $this->remove_orphans( $matches, $counts );
 
         return $stats;
     }
+
+    /** @var int  Anzahl Pseudo-Kennungen, die in diesem Lauf durch echte ersetzt wurden. */
+    private $ids_migrated = 0;
 
     // ──────────────────────────────────────────────────────────────────────
     // Parsed-match log line
@@ -145,7 +213,7 @@ class Fussball_Sync_Manager {
      * Create or update a single match post with verbose action logging.
      *
      * @param array $match  Match data from Fussball_Parser.
-     * @return string  'created' | 'updated_score' | 'updated_details' | 'skipped' | 'cancelled'
+     * @return string  'created' | 'updated_score' | 'updated_details' | 'skipped' | 'cancelled' | 'out_of_season'
      */
     private function sync_single_match( array $match ) {
         $label = sprintf(
@@ -162,13 +230,33 @@ class Fussball_Sync_Manager {
             return 'skipped';
         }
 
-        // ── Guard: cancelled match ─────────────────────────────────────────
-        if ( $match['status'] === 'cancelled' ) {
-            fussball_sync_log( '[SKIP cancelled]  ' . $label . '  |  Absetzung on fussball.de' );
-            return 'cancelled';
+        // ── Guard: match outside the configured season range ───────────────
+        if ( ! $this->is_in_season( $match['date'] ) ) {
+            fussball_sync_log( sprintf(
+                '[SKIP out of season]  %s  |  outside %s – %s',
+                $label,
+                $this->season_start ?: '…',
+                $this->season_end   ?: '…'
+            ) );
+            return 'out_of_season';
         }
 
-        $existing_id = $this->find_post_by_match_id( $match['match_id'] );
+        $existing_id = $this->find_post_for_match( $match );
+        if ( $existing_id ) {
+            $this->matched[ $existing_id ] = true;
+        }
+
+        // ── Guard: cancelled match ─────────────────────────────────────────
+        // Gibt es dazu schon einen Beitrag ohne Ergebnis, kommt er in den Papierkorb (sonst stünde er ewig als „Ergebnis offen“).
+        if ( $match['status'] === 'cancelled' ) {
+            if ( $existing_id && ! $this->post_has_score( $existing_id ) ) {
+                fussball_sync_log( '[ABGESAGT]  ' . $label . '  |  post #' . $existing_id . ' → Papierkorb' . ( $this->dry ? ' (dry)' : '' ) );
+                if ( ! $this->dry ) { wp_trash_post( $existing_id ); }
+            } else {
+                fussball_sync_log( '[SKIP cancelled]  ' . $label . '  |  Absetzung on fussball.de' );
+            }
+            return 'cancelled';
+        }
 
         // ── Resolve team flags ─────────────────────────────────────────────
         // Read flags already stored for this post; preserve non-empty ones.
@@ -189,11 +277,11 @@ class Fussball_Sync_Manager {
                 ? 'score: ' . $match['home_goals'] . ':' . $match['away_goals']
                 : 'no score yet';
 
-            fussball_sync_log( '[CREATE]  ' . $label . '  |  ' . $score_note . $friendly_note );
+            fussball_sync_log( '[CREATE]  ' . $label . '  |  ' . $score_note . $friendly_note . ( $this->dry ? '  (dry)' : '' ) );
             foreach ( $flag_log_lines as $line ) {
                 fussball_sync_log( $line );
             }
-            $this->create_post( $match );
+            if ( ! $this->dry ) { $this->create_post( $match ); }
             return 'created';
         }
 
@@ -201,9 +289,9 @@ class Fussball_Sync_Manager {
         $diff = $this->detect_changes( $existing_id, $match );
 
         if ( ! $diff['needs_update'] ) {
-            $category_fixed = $this->maybe_fix_category( $existing_id, $match );
+            $category_fixed = $this->dry ? false : $this->maybe_fix_category( $existing_id, $match );
 
-            if ( $flags_newly_resolved ) {
+            if ( $flags_newly_resolved && ! $this->dry ) {
                 $this->fill_flags_meta( $existing_id, $match );
                 foreach ( $flag_log_lines as $line ) {
                     fussball_sync_log( $line );
@@ -235,19 +323,19 @@ class Fussball_Sync_Manager {
         $only_score = $diff['changes']['score'] && ! $diff['changes']['teams'] && ! $diff['changes']['datetime'];
 
         if ( $only_score ) {
-            fussball_sync_log( '[UPDATE score]  ' . $label . '  |  post #' . $existing_id . '  |  ' . $change_desc . $friendly_note );
+            fussball_sync_log( '[UPDATE score]  ' . $label . '  |  post #' . $existing_id . '  |  ' . $change_desc . $friendly_note . ( $this->dry ? '  (dry)' : '' ) );
             foreach ( $flag_log_lines as $line ) {
                 fussball_sync_log( $line );
             }
-            $this->update_post( $existing_id, $match );
+            if ( ! $this->dry ) { $this->update_post( $existing_id, $match ); }
             return 'updated_score';
         }
 
-        fussball_sync_log( '[UPDATE details]  ' . $label . '  |  post #' . $existing_id . '  |  ' . $change_desc . $friendly_note );
+        fussball_sync_log( '[UPDATE details]  ' . $label . '  |  post #' . $existing_id . '  |  ' . $change_desc . $friendly_note . ( $this->dry ? '  (dry)' : '' ) );
         foreach ( $flag_log_lines as $line ) {
             fussball_sync_log( $line );
         }
-        $this->update_post( $existing_id, $match );
+        if ( ! $this->dry ) { $this->update_post( $existing_id, $match ); }
         return 'updated_details';
     }
 
@@ -267,14 +355,14 @@ class Fussball_Sync_Manager {
      * @return int  Number of duplicate posts removed.
      */
     private function remove_duplicates() {
-        $posts = get_posts( array(
+        $posts = get_posts( $this->scope_query( array(
             'post_type'      => 'fixture_and_result',
             'post_status'    => array( 'publish', 'draft', 'private' ),
             'posts_per_page' => -1,
             'fields'         => 'ids',
             'orderby'        => 'ID',
             'order'          => 'ASC',
-        ) );
+        ) ) );
 
         // Build a map: "date|home|away" => [ ['id'=>int, 'has_flags'=>bool], … ]
         $seen = array();
@@ -296,11 +384,15 @@ class Fussball_Sync_Manager {
 
             $has_flags = ! empty( trim( $settings['home-flag'] ?? '' ) )
                       || ! empty( trim( $settings['away-flag'] ?? '' ) );
+            $has_score = '' !== trim( (string) ( $settings['home-goal'] ?? '' ) ) && '' !== trim( (string) ( $settings['away-goal'] ?? '' ) );
+            $real_id   = 0 !== strpos( (string) get_post_meta( $post_id, 'fussball_match_id', true ), 'pseudo_' );
 
             $key = $date . '|' . $home . '|' . $away;
             $seen[ $key ][] = array(
                 'id'        => (int) $post_id,
                 'has_flags' => $has_flags,
+                'has_score' => $has_score,
+                'real_id'   => $real_id,
             );
         }
 
@@ -310,27 +402,24 @@ class Fussball_Sync_Manager {
                 continue;
             }
 
-            // Prefer keeping the post that has flags (images) set.
-            // Among equal candidates, keep the newest (highest ID).
+            // Behalten wird: mit Ergebnis vor ohne, echte fussball.de-Kennung vor Pseudo, mit Wappen vor ohne, sonst der neueste.
             usort( $entries, function ( $a, $b ) {
-                // Posts WITH flags sort last (= kept)
-                if ( $a['has_flags'] !== $b['has_flags'] ) {
-                    return $a['has_flags'] ? 1 : -1;
-                }
-                // Same flag status: higher ID sorts last (= kept)
-                return $a['id'] - $b['id'];
+                return array( (int) $a['has_score'], (int) $a['real_id'], (int) $a['has_flags'], $a['id'] )
+                   <=> array( (int) $b['has_score'], (int) $b['real_id'], (int) $b['has_flags'], $b['id'] );
             } );
 
             $keep = array_pop( $entries );
             foreach ( $entries as $dup ) {
-                wp_trash_post( $dup['id'] );
+                if ( ! $this->dry ) { wp_trash_post( $dup['id'] ); }
                 $removed++;
                 fussball_sync_log( sprintf(
-                    '[DEDUP]  Trashed post #%d (duplicate of #%d, flags: %s)  |  key: %s',
+                    '[DEDUP]  post #%d → Papierkorb (Dublette von #%d; Ergebnis: %s, Kennung: %s)  |  %s%s',
                     $dup['id'],
                     $keep['id'],
-                    $dup['has_flags'] ? 'yes' : 'no',
-                    $key
+                    $dup['has_score'] ? 'ja' : 'nein',
+                    $dup['real_id'] ? 'echt' : 'pseudo',
+                    $key,
+                    $this->dry ? '  (dry)' : ''
                 ) );
             }
         }
@@ -355,7 +444,7 @@ class Fussball_Sync_Manager {
      * @return int|null  Post ID or null.
      */
     private function find_post_by_match_id( $match_id ) {
-        $posts = get_posts( array(
+        $posts = get_posts( $this->scope_query( array(
             'post_type'      => 'fixture_and_result',
             'post_status'    => array( 'publish', 'draft', 'private' ),
             'posts_per_page' => 1,
@@ -366,9 +455,114 @@ class Fussball_Sync_Manager {
                 ),
             ),
             'fields'         => 'ids',
-        ) );
+        ) ) );
 
         return ! empty( $posts ) ? (int) $posts[0] : null;
+    }
+
+    /**
+     * Beitrag zu einem fussball.de-Spiel finden:
+     *  1. über die Kennung (echte fussball.de-ID oder aktuelle Pseudo-Kennung),
+     *  2. über die alten Pseudo-Kennungen (md5 aus Datum + rohen Namen, wie bis Version 1.1 gespeichert),
+     *  3. über Datum + tolerante Teamschlüssel (erkennt „(Flex)“ und „II/I/I“-Varianten).
+     * Treffer über 2. oder 3. bekommen sofort die echte Kennung (einmalige Umstellung).
+     */
+    private function find_post_for_match( array $match ) {
+        $id = $this->find_post_by_match_id( $match['match_id'] );
+        if ( $id ) {
+            return $id;
+        }
+        $home = $match['home_team'] ?? ''; $away = $match['away_team'] ?? ''; $date = $match['date'] ?? '';
+        $legacy = array(
+            'pseudo_' . md5( $date . $home . $away ),
+            'pseudo_' . md5( $date . fussball_sync_team_key( $home ) . fussball_sync_team_key( $away ) ),
+        );
+        foreach ( array_unique( $legacy ) as $pid ) {
+            if ( $pid === $match['match_id'] ) { continue; }
+            $id = $this->find_post_by_match_id( $pid );
+            if ( $id ) { break; }
+        }
+        if ( ! $id ) {
+            if ( null === $this->key_cache ) { $this->build_key_cache(); }
+            $key = $date . '|' . fussball_sync_team_key( $home ) . '|' . fussball_sync_team_key( $away );
+            if ( isset( $this->key_cache[ $key ] ) ) {
+                // mehrere Kandidaten (Dubletten): den mit Ergebnis bevorzugen, sonst den neuesten
+                $cands = $this->key_cache[ $key ];
+                usort( $cands, function ( $a, $b ) { return array( $this->post_has_score( $b ), $b ) <=> array( $this->post_has_score( $a ), $a ); } );
+                $id = (int) $cands[0];
+            }
+        }
+        if ( $id && 0 !== strpos( $match['match_id'], 'pseudo_' ) ) {
+            fussball_sync_log( sprintf( '[ID]  post #%d  %s  |  Kennung → %s%s', $id, get_post_meta( $id, 'fussball_match_id', true ), $match['match_id'], $this->dry ? '  (dry)' : '' ) );
+            if ( ! $this->dry ) { update_post_meta( $id, 'fussball_match_id', $match['match_id'] ); }
+            $this->ids_migrated++;
+        }
+        return $id ?: null;
+    }
+
+    private function build_key_cache() {
+        $this->key_cache = array();
+        foreach ( $this->all_fixture_posts() as $post_id => $settings ) {
+            $date = trim( $settings['date-of-match'] ?? '' );
+            if ( '' === $date ) { continue; }
+            $key = $date . '|' . fussball_sync_team_key( $settings['home'] ?? '' ) . '|' . fussball_sync_team_key( $settings['away'] ?? '' );
+            $this->key_cache[ $key ][] = $post_id;
+        }
+    }
+
+    /** Alle Spiel-Beiträge mit dekodierten Einstellungen: [ post_id => settings ]. */
+    private function all_fixture_posts() {
+        $out = array();
+        $ids = get_posts( $this->scope_query( array( 'post_type' => 'fixture_and_result', 'post_status' => array( 'publish', 'draft', 'private' ), 'posts_per_page' => -1, 'fields' => 'ids', 'orderby' => 'ID', 'order' => 'ASC' ) ) );
+        foreach ( $ids as $post_id ) {
+            $raw = $this->safe_decode( get_post_meta( $post_id, 'gdlr-soccer-fixture-result-settings', true ) );
+            $settings = ! empty( $raw ) ? json_decode( $raw, true ) : array();
+            if ( is_array( $settings ) ) { $out[ (int) $post_id ] = $settings; }
+        }
+        return $out;
+    }
+
+    private function post_has_score( $post_id ) {
+        $raw = $this->safe_decode( get_post_meta( $post_id, 'gdlr-soccer-fixture-result-settings', true ) );
+        $s = ! empty( $raw ) ? json_decode( $raw, true ) : array();
+        return is_array( $s ) && '' !== trim( (string) ( $s['home-goal'] ?? '' ) ) && '' !== trim( (string) ( $s['away-goal'] ?? '' ) );
+    }
+
+    /**
+     * Waisen bereinigen: Beiträge in den Kategorien dieses Teams, die vom Sync stammen (fussball_match_id gesetzt),
+     * in der Saison liegen, in diesem Lauf keinem fussball.de-Spiel zugeordnet wurden und kein Ergebnis haben
+     * (verschobene oder entfernte Spiele). Schutz: nur wenn fussball.de für den Zeitraum (Vergangenheit bzw. Zukunft)
+     * überhaupt Spiele geliefert hat, damit eine leere Antwort nicht den Spielplan leert.
+     */
+    private function remove_orphans( array $matches, array $counts ) {
+        $cats = array_filter( array( $this->category, $this->friendly_category ) );
+        if ( ! $cats || count( $matches ) < 5 ) {
+            return 0;
+        }
+        $today = current_time( 'Y-m-d' );
+        $ids = get_posts( array(
+            'post_type' => 'fixture_and_result', 'post_status' => array( 'publish', 'draft', 'private' ), 'posts_per_page' => -1, 'fields' => 'ids',
+            'tax_query' => array( array( 'taxonomy' => 'result_category', 'field' => 'slug', 'terms' => array_values( $cats ) ) ),
+            'meta_query' => array( array( 'key' => 'fussball_match_id', 'compare' => 'EXISTS' ) ),
+        ) );
+        $removed = 0;
+        foreach ( $ids as $post_id ) {
+            $post_id = (int) $post_id;
+            if ( isset( $this->matched[ $post_id ] ) ) { continue; }
+            $raw = $this->safe_decode( get_post_meta( $post_id, 'gdlr-soccer-fixture-result-settings', true ) );
+            $s = ! empty( $raw ) ? json_decode( $raw, true ) : array();
+            if ( ! is_array( $s ) ) { continue; }
+            $date = trim( $s['date-of-match'] ?? '' );
+            if ( '' === $date || ! $this->is_in_season( $date ) ) { continue; }
+            if ( '' !== trim( (string) ( $s['home-goal'] ?? '' ) ) || '' !== trim( (string) ( $s['away-goal'] ?? '' ) ) ) { continue; }
+            $past = $date < $today;
+            if ( ( $past && empty( $counts['prev'] ) ) || ( ! $past && empty( $counts['upcoming'] ) ) ) { continue; }
+            fussball_sync_log( sprintf( '[VERWAIST]  %s vs %s (%s)  |  post #%d nicht mehr bei fussball.de, kein Ergebnis → Papierkorb%s', $s['home'] ?? '?', $s['away'] ?? '?', $date, $post_id, $this->dry ? '  (dry)' : '' ) );
+            if ( ! $this->dry ) { wp_trash_post( $post_id ); }
+            $removed++;
+        }
+        if ( ! $removed ) { fussball_sync_log( '[VERWAIST]  keine.' ); }
+        return $removed;
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -792,11 +986,7 @@ class Fussball_Sync_Manager {
      * @return string
      */
     private function normalise_team_name( $name ) {
-        $name = mb_strtolower( trim( $name ), 'UTF-8' );
-        $name = preg_replace( '/\s+/', ' ', $name );
-        // Strip trailing "e.v." / "e. v." (common German club suffix)
-        $name = preg_replace( '/\s+e\.?\s*v\.?\s*$/u', '', $name );
-        return trim( $name );
+        return fussball_sync_team_key( $name ); // gemeinsamer Schlüssel (fussball-sync.php): Klammerzusätze, SGM-Ziffern, e. V.
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -846,6 +1036,24 @@ class Fussball_Sync_Manager {
         }
 
         wp_set_object_terms( $post_id, $expected, 'result_category', false );
+        return true;
+    }
+
+    /**
+     * Check whether a match date falls inside the configured season range.
+     * Dates use the Y-m-d format, so plain string comparison is sufficient.
+     * An empty bound means "no limit" on that side.
+     *
+     * @param string $date  Match date (Y-m-d).
+     * @return bool
+     */
+    private function is_in_season( $date ) {
+        if ( ! empty( $this->season_start ) && $date < $this->season_start ) {
+            return false;
+        }
+        if ( ! empty( $this->season_end ) && $date > $this->season_end ) {
+            return false;
+        }
         return true;
     }
 
