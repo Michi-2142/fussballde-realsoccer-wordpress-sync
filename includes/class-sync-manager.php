@@ -33,6 +33,12 @@ class Fussball_Sync_Manager {
     /** @var string  result_category taxonomy slug for friendly games (competition contains "Freundschaftsspiel"). */
     private $friendly_category;
 
+    /** @var string  First day of the current season (Y-m-d). Empty = no lower bound. */
+    private $season_start;
+
+    /** @var string  Last day of the current season (Y-m-d). Empty = no upper bound. */
+    private $season_end;
+
     /**
      * Lazy-built cache: normalised_team_name => ['value'=>string, 'source'=>string].
      * Built once per sync run from all existing fixture_and_result posts.
@@ -44,10 +50,14 @@ class Fussball_Sync_Manager {
     /**
      * @param string $category           Taxonomy slug for regular matches (empty = no assignment).
      * @param string $friendly_category  Taxonomy slug for friendly games (empty = use $category).
+     * @param string $season_start       First day of the season, Y-m-d (empty = no lower bound).
+     * @param string $season_end         Last day of the season, Y-m-d (empty = no upper bound).
      */
-    public function __construct( $category = '', $friendly_category = '' ) {
+    public function __construct( $category = '', $friendly_category = '', $season_start = '', $season_end = '' ) {
         $this->category          = sanitize_text_field( $category );
         $this->friendly_category = sanitize_text_field( $friendly_category );
+        $this->season_start      = sanitize_text_field( $season_start );
+        $this->season_end        = sanitize_text_field( $season_end );
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -58,7 +68,7 @@ class Fussball_Sync_Manager {
      * Process all matches, generate verbose logs, and return stats.
      *
      * @param array $matches  Array of match data from Fussball_Parser.
-     * @return array  ['created'=>int, 'updated_score'=>int, 'updated_details'=>int, 'skipped'=>int, 'cancelled'=>int]
+     * @return array  ['created'=>int, 'updated_score'=>int, 'updated_details'=>int, 'skipped'=>int, 'cancelled'=>int, 'out_of_season'=>int, 'duplicates_removed'=>int]
      */
     public function sync_matches( array $matches ) {
         $stats = array(
@@ -67,8 +77,17 @@ class Fussball_Sync_Manager {
             'updated_details'    => 0,
             'skipped'            => 0,
             'cancelled'          => 0,
+            'out_of_season'      => 0,
             'duplicates_removed' => 0,
         );
+
+        if ( ! empty( $this->season_start ) || ! empty( $this->season_end ) ) {
+            fussball_sync_log( sprintf(
+                'Season filter active: %s – %s (matches outside this range are ignored).',
+                $this->season_start ?: '…',
+                $this->season_end   ?: '…'
+            ) );
+        }
 
         // ── 1. Log everything that was parsed  ────────────────────────────
         fussball_sync_log( sprintf( '── Parsed %d matches from fussball.de ──', count( $matches ) ) );
@@ -145,7 +164,7 @@ class Fussball_Sync_Manager {
      * Create or update a single match post with verbose action logging.
      *
      * @param array $match  Match data from Fussball_Parser.
-     * @return string  'created' | 'updated_score' | 'updated_details' | 'skipped' | 'cancelled'
+     * @return string  'created' | 'updated_score' | 'updated_details' | 'skipped' | 'cancelled' | 'out_of_season'
      */
     private function sync_single_match( array $match ) {
         $label = sprintf(
@@ -160,6 +179,17 @@ class Fussball_Sync_Manager {
         if ( empty( $match['date'] ) || empty( $match['match_id'] ) ) {
             fussball_sync_log( '[SKIP invalid]  ' . $label . '  |  missing date or match_id' );
             return 'skipped';
+        }
+
+        // ── Guard: match outside the configured season range ───────────────
+        if ( ! $this->is_in_season( $match['date'] ) ) {
+            fussball_sync_log( sprintf(
+                '[SKIP out of season]  %s  |  outside %s – %s',
+                $label,
+                $this->season_start ?: '…',
+                $this->season_end   ?: '…'
+            ) );
+            return 'out_of_season';
         }
 
         // ── Guard: cancelled match ─────────────────────────────────────────
@@ -846,6 +876,24 @@ class Fussball_Sync_Manager {
         }
 
         wp_set_object_terms( $post_id, $expected, 'result_category', false );
+        return true;
+    }
+
+    /**
+     * Check whether a match date falls inside the configured season range.
+     * Dates use the Y-m-d format, so plain string comparison is sufficient.
+     * An empty bound means "no limit" on that side.
+     *
+     * @param string $date  Match date (Y-m-d).
+     * @return bool
+     */
+    private function is_in_season( $date ) {
+        if ( ! empty( $this->season_start ) && $date < $this->season_start ) {
+            return false;
+        }
+        if ( ! empty( $this->season_end ) && $date > $this->season_end ) {
+            return false;
+        }
         return true;
     }
 
