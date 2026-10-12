@@ -4,7 +4,7 @@
  * Plugin URI:   https://www.codeunity.de
  * Description:  Holt Spiele und Ergebnisse mehrerer Mannschaften von fussball.de in den eigenen Beitragstyp „Spiele“.
  *               Eigenständig, ohne Abhängigkeit von Theme oder Goodlayers Soccer.
- * Version:      2.0.0
+ * Version:      2.1.0
  * Author:       Michael Silzle
  * Author URI:   https://www.codeunity.de
  * Text Domain:  fussball-sync
@@ -13,7 +13,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'FUSSBALL_SYNC_VERSION', '2.0.0' );
+define( 'FUSSBALL_SYNC_VERSION', '2.1.0' );
 define( 'FUSSBALL_SYNC_FILE',    __FILE__ );
 define( 'FUSSBALL_SYNC_DIR',     plugin_dir_path( __FILE__ ) );
 
@@ -22,6 +22,7 @@ define( 'FUSSBALL_SYNC_DIR',     plugin_dir_path( __FILE__ ) );
 // ──────────────────────────────────────────────────────────────────────────────
 require_once FUSSBALL_SYNC_DIR . 'includes/spiele.php';
 require_once FUSSBALL_SYNC_DIR . 'includes/migration.php';
+require_once FUSSBALL_SYNC_DIR . 'includes/tabelle.php';
 require_once FUSSBALL_SYNC_DIR . 'includes/class-font-decoder.php';
 require_once FUSSBALL_SYNC_DIR . 'includes/class-fussball-parser.php';
 require_once FUSSBALL_SYNC_DIR . 'includes/class-sync-manager.php';
@@ -248,6 +249,16 @@ function fussball_sync_run_team( array $team, $season_start = '', $season_end = 
             $stats['duplicates_removed'],
             $stats['orphans_removed']
         ) );
+
+        // Ligatabelle der Mannschaft (nur bei Ligamannschaften vorhanden)
+        $tabelle = fussball_sync_tabelle_holen( $team, ! empty( $team['dry_run'] ) );
+        if ( is_wp_error( $tabelle ) ) {
+            fussball_sync_log( sprintf( '[%s] [TABELLE] nicht aktualisiert: %s', $name, $tabelle->get_error_message() ) );
+        } else {
+            $eigen = array_values( array_filter( $tabelle['zeilen'], function ( $z ) { return $z['eigen']; } ) );
+            $ohne  = count( array_filter( $tabelle['zeilen'], function ( $z ) { return '' === $z['wappen']; } ) );
+            fussball_sync_log( sprintf( '[%s] [TABELLE] %d Mannschaften, eigener Platz %s, ohne Wappen: %d%s', $name, count( $tabelle['zeilen'] ), $eigen ? $eigen[0]['platz'] : '?', $ohne, ! empty( $team['dry_run'] ) ? ' (dry)' : '' ) );
+        }
     } catch ( Exception $e ) {
         fussball_sync_log( sprintf( '[%s] Sync error: %s', $name, $e->getMessage() ) );
     }

@@ -17,6 +17,7 @@ admin/
 includes/
   spiele.php                Data model: post type, taxonomy, meta fields, read/write API, edit screen, list columns
   migration.php             One-time migration from Goodlayers Soccer (fixture_and_result) with rollback
+  tabelle.php               League table: fetch, parse and store per team, crest lookup
   class-fussball-parser.php Fetches & parses fussball.de HTML
   class-font-decoder.php    Decodes obfuscated scores (TTF font parsing)
   class-sync-manager.php    Creates/updates/cleans up match posts
@@ -26,6 +27,7 @@ includes/
 
 - **Automatic sync** via WP-Cron (hourly / 6 h / 12 h / twice daily / daily / disabled)
 - **Standalone data model** (since 2.0.0): post type `fussball_spiel` (admin only, menu "Spiele"), taxonomy `fussball_mannschaft`, flat meta fields, German edit screen with media picker for crests, list columns (kick-off, result, team, competition, source)
+- **League table** (since 2.1.0): after each team sync the current table of the team's league is fetched from fussball.de (the division is read from the team page) and stored per team; crests come from existing matches or the Media Library, never as images from fussball.de. Teams without a league (friendlies only) are skipped with a log entry
 - **Multiple teams** (since 1.1.0): every team row has a label (= team), its fussball.de URL and an optional league display name
 - **Manual sync** button in the admin panel
 - **Score decoding**: parses fussball.de's custom obfuscation fonts (PUA characters in TTF) to extract real scores
@@ -82,7 +84,10 @@ fussball_spiel( $post_id );            // normalised array incl. gespielt, art, 
 fussball_wappen_url( $wert );          // crest URL from ID or URL
 fussball_spiel_wettbewerb_anzeige( $spiel );
 fussball_sync_get_teams( false );      // configured teams
+fussball_tabelle( '1-mannschaft' );    // league table or null (since 2.1.0)
 ```
+
+`fussball_tabelle()` returns `stand` (time of the fetch), `saison`, `staffel` and `zeilen`, one row per team with `platz`, `team`, `team_id`, `eigen` (own team), `spiele`, `g`, `u`, `v`, `tore`, `gegentore`, `diff`, `punkte`, `zone` (`aufstieg`, `aufstieg-relegation`, `abstieg-relegation`, `abstieg` or empty), `trend` (`hoch`, `runter`, `gleich`) and `wappen` (attachment ID, URL or empty). It is stored in the option `fussball_sync_tabelle_{team slug}` (not autoloaded).
 
 ## Upgrading from 1.x
 
@@ -106,7 +111,15 @@ Version 2.0 stops syncing until the existing Goodlayers matches are migrated (Se
 
 5. **Sync**: New `fussball_spiel` posts are created, existing ones are updated only when something changed. Manually set crests and the venue are preserved. Afterwards duplicates (`[DEDUP]`) and orphans (`[VERWAIST]`) are moved to the trash; cancelled matches without a score are logged as `[ABGESAGT]`.
 
+6. **Table**: The team page links the table as `ajax.team.table/-/saison/<season>/staffel/<division>/team-id/<id>`. The plugin loads that table, reads rank, games, wins, draws, losses, goals, points, promotion and relegation zones and the trend arrows, and logs the result as `[TABELLE]`. A table with fewer than 4 rows is treated as an error and the stored table stays unchanged.
+
 ## Changelog
+
+### 2.1.0 (2026-10-12)
+
+- League table per team from fussball.de, fetched after every team sync (also in dry runs, then without saving)
+- Read API `fussball_tabelle()`; zones, trend and own team are part of each row
+- Crests for table rows from existing matches or the Media Library
 
 ### 2.0.0 (2026-10-12)
 
