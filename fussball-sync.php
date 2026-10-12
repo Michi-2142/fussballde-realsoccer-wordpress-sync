@@ -5,7 +5,7 @@
  * Description:  Syncs match results from fussball.de into the Goodlayers Soccer plugin
  *               (Fixtures & Results custom post type). Supports several teams, each with
  *               its own result categories.
- * Version:      1.1.0
+ * Version:      1.2.0
  * Author:       Michael Silzle
  * Author URI:   https://www.codeunity.de
  * Text Domain:  fussball-sync
@@ -14,7 +14,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'FUSSBALL_SYNC_VERSION', '1.1.0' );
+define( 'FUSSBALL_SYNC_VERSION', '1.2.0' );
 define( 'FUSSBALL_SYNC_FILE',    __FILE__ );
 define( 'FUSSBALL_SYNC_DIR',     plugin_dir_path( __FILE__ ) );
 
@@ -134,6 +134,26 @@ function fussball_sync_get_teams( $active_only = true ) {
 }
 
 /**
+ * Vergleichsschlüssel für Teamnamen: erkennt dieselbe Mannschaft trotz kleiner Abweichungen.
+ *  - Kleinschreibung, HTML-Entities und unsichtbare Zeichen (U+200B) weg, Leerraum zusammengefasst
+ *  - Klammerzusätze am Ende weg: „SGM Wittendorf/Lombach/Loßburg (Flex)“ = „SGM Wittendorf/Lombach/Loßburg“
+ *  - in Spielgemeinschaften (Name mit „/“) römische Ziffern je Teil weg: „SGM Wittendorf II/Lombach I/Loßburg I“ = „SGM Wittendorf/Lombach/Loßburg“
+ *    (bei einzelnen Vereinen bleibt „II“ stehen, „SV Dietersweiler II“ ist eine andere Mannschaft als „SV Dietersweiler“)
+ *  - „e. V.“ am Ende weg
+ */
+function fussball_sync_team_key( $name ) {
+    $name = html_entity_decode( (string) $name, ENT_QUOTES, 'UTF-8' );
+    $name = str_replace( array( "\xE2\x80\x8B", "\xC2\xA0" ), array( '', ' ' ), $name );
+    $name = mb_strtolower( trim( $name ), 'UTF-8' );
+    $name = preg_replace( '/\s*\([^)]*\)\s*$/u', '', $name );
+    if ( false !== strpos( $name, '/' ) ) {
+        $name = preg_replace( '/\s+(?:i{1,3}|iv|v|\d)(?=\s*\/|\s*$)/u', '', $name );
+    }
+    $name = preg_replace( '/\s+e\.?\s*v\.?\s*$/u', '', $name );
+    return trim( preg_replace( '/\s+/u', ' ', $name ) );
+}
+
+/**
  * Extract team-id and season from a fussball.de team URL.
  *
  * @param string $url
@@ -201,18 +221,24 @@ function fussball_sync_run_team( array $team, $season_start = '', $season_end = 
         fussball_sync_log( sprintf( '[%s] Fetched %d matches from fussball.de.', $name, count( $matches ) ) );
 
         $manager = new Fussball_Sync_Manager( $team['category'], $team['friendly_category'], $season_start, $season_end );
-        $stats   = $manager->sync_matches( $matches );
+        if ( ! empty( $team['dry_run'] ) ) {
+            $manager->set_dry_run( true );
+        }
+        $stats   = $manager->sync_matches( $matches, $parser->counts );
 
         fussball_sync_log( sprintf(
-            '[%s] Sync complete. Created: %d | Score updated: %d | Details updated: %d | Cancelled (skipped): %d | Out of season (skipped): %d | No change: %d | Duplicates removed: %d.',
+            '[%s] Sync complete%s. Created: %d | Score updated: %d | Details updated: %d | Cancelled: %d | Out of season (skipped): %d | No change: %d | IDs migrated: %d | Duplicates removed: %d | Orphans removed: %d.',
             $name,
+            ! empty( $team['dry_run'] ) ? ' (DRY RUN, nichts geschrieben)' : '',
             $stats['created'],
             $stats['updated_score'],
             $stats['updated_details'],
             $stats['cancelled'],
             $stats['out_of_season'],
             $stats['skipped'],
-            $stats['duplicates_removed']
+            $stats['ids_migrated'],
+            $stats['duplicates_removed'],
+            $stats['orphans_removed']
         ) );
     } catch ( Exception $e ) {
         fussball_sync_log( sprintf( '[%s] Sync error: %s', $name, $e->getMessage() ) );

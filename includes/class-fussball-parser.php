@@ -69,9 +69,13 @@ class Fussball_Parser {
      *
      * @return array  Array of match data arrays (see class docblock).
      */
+    /** @var array  Anzahl geholter Spiele je Endpunkt des letzten Laufs (für die Waisen-Bereinigung als Schutz vor leeren Antworten). */
+    public $counts = array( 'prev' => 0, 'upcoming' => 0 );
+
     public function get_all_matches() {
         $prev_matches     = $this->fetch_endpoint( 'prev.games' );
         $upcoming_matches = $this->fetch_endpoint( 'matchplan' );
+        $this->counts     = array( 'prev' => count( $prev_matches ), 'upcoming' => count( $upcoming_matches ) );
 
         // Merge with match_id-based deduplication (upcoming takes precedence)
         $by_id = array();
@@ -324,12 +328,14 @@ class Fussball_Parser {
 
         // ── Match ID (from any "/spiel/ID" link) ─────────────────────────
         $match_id = null;
-        if ( preg_match( '|/spiel/([A-Z0-9]+)(?:/|")|i', $body, $sid ) ) {
+        // Die Kennung ist der letzte Pfadteil des Spiel-Links (…/-/spiel/031EOMHGI0000000VS5489BTVUS470OH).
+        // Früher stand hier ein Muster mit „|“ als Begrenzer UND als Oder-Zeichen, das war ungültig, deshalb bekam jedes Spiel eine Pseudo-Kennung.
+        if ( preg_match( '#/-/spiel/([A-Z0-9]{16,})(?![A-Za-z0-9])#', $body, $sid ) ) {
             $match_id = $sid[1];
         }
         if ( empty( $match_id ) ) {
-            // Fallback: generate a pseudo-ID from date+teams
-            $match_id = 'pseudo_' . md5( $date . $home_team . $away_team );
+            // Fallback: Pseudo-Kennung aus Datum und normalisierten Teamnamen (Klammerzusätze wie „(Flex)“ zählen nicht)
+            $match_id = 'pseudo_' . md5( $date . fussball_sync_team_key( $home_team ) . fussball_sync_team_key( $away_team ) );
         }
 
         // ── Score ─────────────────────────────────────────────────────────
