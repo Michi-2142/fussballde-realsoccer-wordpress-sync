@@ -2,10 +2,9 @@
 /**
  * Plugin Name:  Fussball.de Sync
  * Plugin URI:   https://www.codeunity.de
- * Description:  Syncs match results from fussball.de into the Goodlayers Soccer plugin
- *               (Fixtures & Results custom post type). Supports several teams, each with
- *               its own result categories.
- * Version:      1.2.0
+ * Description:  Holt Spiele und Ergebnisse mehrerer Mannschaften von fussball.de in den eigenen Beitragstyp „Spiele“.
+ *               Eigenständig, ohne Abhängigkeit von Theme oder Goodlayers Soccer.
+ * Version:      2.0.0
  * Author:       Michael Silzle
  * Author URI:   https://www.codeunity.de
  * Text Domain:  fussball-sync
@@ -14,13 +13,15 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'FUSSBALL_SYNC_VERSION', '1.2.0' );
+define( 'FUSSBALL_SYNC_VERSION', '2.0.0' );
 define( 'FUSSBALL_SYNC_FILE',    __FILE__ );
 define( 'FUSSBALL_SYNC_DIR',     plugin_dir_path( __FILE__ ) );
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Autoload includes
 // ──────────────────────────────────────────────────────────────────────────────
+require_once FUSSBALL_SYNC_DIR . 'includes/spiele.php';
+require_once FUSSBALL_SYNC_DIR . 'includes/migration.php';
 require_once FUSSBALL_SYNC_DIR . 'includes/class-font-decoder.php';
 require_once FUSSBALL_SYNC_DIR . 'includes/class-fussball-parser.php';
 require_once FUSSBALL_SYNC_DIR . 'includes/class-sync-manager.php';
@@ -86,10 +87,11 @@ add_action( 'fussball_sync_cron_event', 'fussball_sync_run' );
  * Configured teams.
  *
  * Stored in the option `fussball_sync_teams` as a list of
- *   [ 'label' => string, 'url' => string, 'category' => slug, 'friendly_category' => slug, 'enabled' => '1'|'0' ].
+ *   [ 'label' => Bezeichnung (= Mannschaft), 'url' => fussball.de-Teamseite, 'slug' => Mannschafts-Slug (fest),
+ *     'liga' => Liganame für die Anzeige (optional), 'enabled' => '1'|'0',
+ *     'category' / 'friendly_category' => Kategorien bis 1.2 (nur noch für den Rückweg gespeichert) ].
  * As long as that option does not exist, the single-team settings of version 1.0
  * (fussball_sync_url / _category / _friendly_category) are used as team 1.
- * Those legacy options are never modified, so downgrading to 1.0 keeps working.
  *
  * @param bool $active_only  Only enabled teams with a URL (for syncing). False = all rows (for the settings page).
  * @return array
@@ -114,6 +116,8 @@ function fussball_sync_get_teams( $active_only = true ) {
     $defaults = array(
         'label'             => '',
         'url'               => '',
+        'slug'              => '',
+        'liga'              => '',
         'category'          => '',
         'friendly_category' => '',
         'enabled'           => '1',
@@ -175,6 +179,11 @@ function fussball_sync_run() {
         @set_time_limit( 300 );
     }
 
+    if ( fussball_sync_schema() < 2 ) {
+        fussball_sync_log( 'Datenumstellung auf Version 2.0 steht noch aus (Einstellungen → Fussball.de Sync). Sync ausgesetzt.' );
+        return;
+    }
+
     $teams = fussball_sync_get_teams();
     if ( empty( $teams ) ) {
         fussball_sync_log( 'No active team configured. Sync skipped.' );
@@ -206,12 +215,11 @@ function fussball_sync_run_team( array $team, $season_start = '', $season_end = 
     }
 
     fussball_sync_log( sprintf(
-        '══ [%s] Starting sync: team-id=%s, season=%s, category=%s, friendly category=%s',
+        '══ [%s] Starting sync: team-id=%s, season=%s, Mannschaft=%s',
         $name,
         $params['team_id'],
         $params['season'],
-        $team['category'] ?: '(none)',
-        $team['friendly_category'] ?: '(same)'
+        fussball_sync_team_slug( $team ) ?: '(keine)'
     ) );
 
     try {
@@ -220,7 +228,7 @@ function fussball_sync_run_team( array $team, $season_start = '', $season_end = 
 
         fussball_sync_log( sprintf( '[%s] Fetched %d matches from fussball.de.', $name, count( $matches ) ) );
 
-        $manager = new Fussball_Sync_Manager( $team['category'], $team['friendly_category'], $season_start, $season_end );
+        $manager = new Fussball_Sync_Manager( $team, $season_start, $season_end );
         if ( ! empty( $team['dry_run'] ) ) {
             $manager->set_dry_run( true );
         }
