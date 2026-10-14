@@ -85,6 +85,7 @@ fussball_wappen_url( $wert );          // crest URL from ID or URL
 fussball_spiel_wettbewerb_anzeige( $spiel );
 fussball_sync_get_teams( false );      // configured teams
 fussball_tabelle( '1-mannschaft' );    // league table or null (since 2.1.0)
+add_action( 'fussball_sync_nach_lauf', 'my_flush_cache' ); // after every run (since 2.1.1)
 ```
 
 `fussball_tabelle()` returns `stand` (time of the fetch), `saison`, `staffel` and `zeilen`, one row per team with `platz`, `team`, `team_id`, `eigen` (own team), `spiele`, `g`, `u`, `v`, `tore`, `gegentore`, `diff`, `punkte`, `zone` (`aufstieg`, `aufstieg-relegation`, `abstieg-relegation`, `abstieg` or empty), `trend` (`hoch`, `runter`, `gleich`) and `wappen` (attachment ID, URL or empty). It is stored in the option `fussball_sync_tabelle_{team slug}` (not autoloaded).
@@ -114,6 +115,10 @@ Version 2.0 stops syncing until the existing Goodlayers matches are migrated (Se
 6. **Table**: The team page links the table as `ajax.team.table/-/saison/<season>/staffel/<division>/team-id/<id>`. The plugin loads that table, reads rank, games, wins, draws, losses, goals, points, promotion and relegation zones and the trend arrows, and logs the result as `[TABELLE]`. A table with fewer than 4 rows is treated as an error and the stored table stays unchanged.
 
 ## Changelog
+
+### 2.1.1 (2026-10-14)
+
+- New action `fussball_sync_nach_lauf` after every complete run (cron and manual sync), for example to flush a page cache
 
 ### 2.1.0 (2026-10-12)
 

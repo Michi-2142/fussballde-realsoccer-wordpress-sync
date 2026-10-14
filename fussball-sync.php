@@ -4,7 +4,7 @@
  * Plugin URI:   https://www.codeunity.de
  * Description:  Holt Spiele und Ergebnisse mehrerer Mannschaften von fussball.de in den eigenen Beitragstyp „Spiele“.
  *               Eigenständig, ohne Abhängigkeit von Theme oder Goodlayers Soccer.
- * Version:      2.1.0
+ * Version:      2.1.1
  * Author:       Michael Silzle
  * Author URI:   https://www.codeunity.de
  * Text Domain:  fussball-sync
@@ -13,7 +13,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'FUSSBALL_SYNC_VERSION', '2.1.0' );
+define( 'FUSSBALL_SYNC_VERSION', '2.1.1' );
 define( 'FUSSBALL_SYNC_FILE',    __FILE__ );
 define( 'FUSSBALL_SYNC_DIR',     plugin_dir_path( __FILE__ ) );
 
@@ -197,6 +197,13 @@ function fussball_sync_run() {
     foreach ( $teams as $team ) {
         fussball_sync_run_team( $team, $season_start, $season_end );
     }
+
+    /**
+     * Nach jedem vollständigen Lauf (Cron und „Jetzt synchronisieren“), z. B. um einen Seiten-Cache zu leeren.
+     *
+     * @param array $teams die synchronisierten Mannschaften
+     */
+    do_action( 'fussball_sync_nach_lauf', $teams );
 }
 
 /**
