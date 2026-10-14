@@ -4,10 +4,9 @@
  *
  * Settings stored:
  *   fussball_sync_teams             – List of teams, one row each:
- *                                     label, url (fussball.de team page, team-id + season extracted automatically),
- *                                     category (result_category slug for regular matches),
- *                                     friendly_category (slug for games whose competition contains "Freundschaftsspiel"),
- *                                     enabled ('1' / '0')
+ *                                     label (= Mannschaft), url (fussball.de team page, team-id + season extracted automatically),
+ *                                     slug (Mannschafts-Slug, fest), liga (Liganame für die Anzeige, optional), enabled ('1' / '0');
+ *                                     category / friendly_category aus 1.x bleiben unsichtbar gespeichert (Rückweg)
  *   fussball_sync_interval          – WP-Cron schedule key (all teams)
  *   fussball_sync_season_start      – First day of the current season (Y-m-d, empty = no lower bound, all teams)
  *   fussball_sync_season_end        – Last day of the current season (Y-m-d, empty = no upper bound, all teams)
@@ -73,35 +72,35 @@ function fussball_sync_register_settings() {
 
     add_settings_section(
         'fussball_sync_main',
-        __( 'Sync Configuration', 'fussball-sync' ),
+        'Einstellungen',
         '__return_false',
         'fussball-sync'
     );
 
     add_settings_field(
         'fussball_sync_teams',
-        __( 'Teams', 'fussball-sync' ),
+        'Mannschaften',
         'fussball_sync_field_teams',
         'fussball-sync',
         'fussball_sync_main'
     );
     add_settings_field(
         'fussball_sync_interval',
-        __( 'Sync Interval', 'fussball-sync' ),
+        'Intervall',
         'fussball_sync_field_interval',
         'fussball-sync',
         'fussball_sync_main'
     );
     add_settings_field(
         'fussball_sync_season_start',
-        __( 'Season Start Date', 'fussball-sync' ),
+        'Saisonbeginn',
         'fussball_sync_field_season_start',
         'fussball-sync',
         'fussball_sync_main'
     );
     add_settings_field(
         'fussball_sync_season_end',
-        __( 'Season End Date', 'fussball-sync' ),
+        'Saisonende',
         'fussball_sync_field_season_end',
         'fussball-sync',
         'fussball_sync_main'
@@ -129,6 +128,7 @@ function fussball_sync_sanitize_date( $value ) {
 
 /**
  * Sanitize the team list. Rows without label and URL are dropped (= the empty "add" row or a removed team).
+ * Der Slug einer Mannschaft bleibt fest; neue Zeilen bekommen ihn aus der Bezeichnung (eindeutig gemacht).
  *
  * @param mixed $value
  * @return array
@@ -138,6 +138,7 @@ function fussball_sync_sanitize_teams( $value ) {
     if ( ! is_array( $value ) ) {
         return $out;
     }
+    $slugs = array();
     foreach ( $value as $row ) {
         if ( ! is_array( $row ) ) {
             continue;
@@ -147,9 +148,20 @@ function fussball_sync_sanitize_teams( $value ) {
         if ( '' === $label && '' === $url ) {
             continue;
         }
-        $out[] = array(
+        $slug = sanitize_title( $row['slug'] ?? '' );
+        if ( '' === $slug ) {
+            $slug = sanitize_title( $label ) ?: 'mannschaft';
+            $base = $slug;
+            for ( $n = 2; in_array( $slug, $slugs, true ); $n++ ) {
+                $slug = $base . '-' . $n;
+            }
+        }
+        $slugs[] = $slug;
+        $out[]   = array(
             'label'             => $label,
             'url'               => $url,
+            'slug'              => $slug,
+            'liga'              => sanitize_text_field( $row['liga'] ?? '' ),
             'category'          => sanitize_title( $row['category'] ?? '' ),
             'friendly_category' => sanitize_title( $row['friendly_category'] ?? '' ),
             'enabled'           => empty( $row['enabled'] ) ? '0' : '1',
@@ -173,66 +185,50 @@ function fussball_sync_on_interval_change( $old_value, $new_value ) {
 // Field renderers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/**
- * <select> with all result_category terms (text input as fallback if the taxonomy is missing).
- */
-function fussball_sync_category_select( $name, $value, $empty_label ) {
-    $terms = get_terms( array(
-        'taxonomy'   => 'result_category',
-        'hide_empty' => false,
-    ) );
-
-    if ( is_wp_error( $terms ) || empty( $terms ) ) {
-        return '<input type="text" name="' . esc_attr( $name ) . '" value="' . esc_attr( $value ) . '" class="regular-text" placeholder="slug" />';
-    }
-
-    $html = '<select name="' . esc_attr( $name ) . '" style="max-width:100%;">';
-    $html .= '<option value="">' . esc_html( $empty_label ) . '</option>';
-    foreach ( $terms as $term ) {
-        $html .= '<option value="' . esc_attr( $term->slug ) . '"' . selected( $value, $term->slug, false ) . '>'
-               . esc_html( $term->name ) . ' (' . esc_html( $term->slug ) . ')</option>';
-    }
-    return $html . '</select>';
-}
-
 function fussball_sync_field_teams() {
     $teams   = fussball_sync_get_teams( false );
-    $teams[] = array( 'label' => '', 'url' => '', 'category' => '', 'friendly_category' => '', 'enabled' => '1' ); // empty row to add a team
+    $teams[] = array( 'label' => '', 'url' => '', 'slug' => '', 'liga' => '', 'category' => '', 'friendly_category' => '', 'enabled' => '1' ); // leere Zeile zum Hinzufügen
     ?>
     <table class="widefat striped" style="max-width:1300px;">
         <thead>
             <tr>
-                <th style="width:50px;"><?php esc_html_e( 'Active', 'fussball-sync' ); ?></th>
-                <th style="width:160px;"><?php esc_html_e( 'Label', 'fussball-sync' ); ?></th>
-                <th><?php esc_html_e( 'fussball.de Team URL', 'fussball-sync' ); ?></th>
-                <th style="width:240px;"><?php esc_html_e( 'Result Category', 'fussball-sync' ); ?></th>
-                <th style="width:240px;"><?php esc_html_e( 'Friendly Games Category', 'fussball-sync' ); ?></th>
+                <th style="width:50px;">Aktiv</th>
+                <th style="width:180px;">Mannschaft</th>
+                <th>Teamseite bei fussball.de</th>
+                <th style="width:200px;">Liga (Anzeige)</th>
             </tr>
         </thead>
         <tbody>
         <?php foreach ( $teams as $i => $team ) :
             $n      = 'fussball_sync_teams[' . (int) $i . ']';
             $params = fussball_sync_parse_team_url( $team['url'] );
+            $slug   = '' !== $team['label'] || '' !== $team['url'] ? fussball_sync_team_slug( $team ) : '';
             ?>
             <tr>
                 <td><input type="checkbox" name="<?php echo esc_attr( $n ); ?>[enabled]" value="1" <?php checked( '1', (string) $team['enabled'] ); ?> /></td>
-                <td><input type="text" name="<?php echo esc_attr( $n ); ?>[label]" value="<?php echo esc_attr( $team['label'] ); ?>" style="width:100%;" placeholder="<?php esc_attr_e( 'e.g. 2. Mannschaft', 'fussball-sync' ); ?>" /></td>
+                <td>
+                    <input type="text" name="<?php echo esc_attr( $n ); ?>[label]" value="<?php echo esc_attr( $team['label'] ); ?>" style="width:100%;" placeholder="z. B. 2. Mannschaft" />
+                    <input type="hidden" name="<?php echo esc_attr( $n ); ?>[slug]" value="<?php echo esc_attr( $team['slug'] ?? '' ); ?>" />
+                    <input type="hidden" name="<?php echo esc_attr( $n ); ?>[category]" value="<?php echo esc_attr( $team['category'] ?? '' ); ?>" />
+                    <input type="hidden" name="<?php echo esc_attr( $n ); ?>[friendly_category]" value="<?php echo esc_attr( $team['friendly_category'] ?? '' ); ?>" />
+                    <?php if ( $slug ) : ?><p class="description">Kürzel <code><?php echo esc_html( $slug ); ?></code></p><?php endif; ?>
+                </td>
                 <td>
                     <input type="url" name="<?php echo esc_attr( $n ); ?>[url]" value="<?php echo esc_attr( $team['url'] ); ?>" class="large-text" placeholder="https://www.fussball.de/mannschaft/…/-/saison/2627/team-id/…" />
                     <?php if ( $params ) : ?>
-                        <p class="description">team-id <code><?php echo esc_html( $params['team_id'] ); ?></code> | season <code><?php echo esc_html( $params['season'] ); ?></code></p>
+                        <p class="description">team-id <code><?php echo esc_html( $params['team_id'] ); ?></code> | Saison <code><?php echo esc_html( $params['season'] ); ?></code></p>
                     <?php elseif ( '' !== $team['url'] ) : ?>
-                        <p class="description" style="color:#b32d2e;"><?php esc_html_e( 'Could not extract team-id / season from this URL.', 'fussball-sync' ); ?></p>
+                        <p class="description" style="color:#b32d2e;">Aus dieser Adresse lassen sich team-id und Saison nicht lesen.</p>
                     <?php endif; ?>
                 </td>
-                <td><?php echo fussball_sync_category_select( $n . '[category]', $team['category'], __( '— None —', 'fussball-sync' ) ); // phpcs:ignore WordPress.Security.EscapeOutput ?></td>
-                <td><?php echo fussball_sync_category_select( $n . '[friendly_category]', $team['friendly_category'], __( '— Same as Result Category —', 'fussball-sync' ) ); // phpcs:ignore WordPress.Security.EscapeOutput ?></td>
+                <td><input type="text" name="<?php echo esc_attr( $n ); ?>[liga]" value="<?php echo esc_attr( $team['liga'] ?? '' ); ?>" style="width:100%;" placeholder="z. B. Kreisliga B3" /></td>
             </tr>
         <?php endforeach; ?>
         </tbody>
     </table>
     <p class="description">
-        <?php esc_html_e( 'One row per team, every active row is synced on each run. Add a team by filling in the empty last row and saving; remove a team by clearing its label and URL. Each team writes its matches into its own categories, so a page builder element shows one team by filtering on that team\'s categories. Matches whose competition contains "Freundschaftsspiel" go into the friendly games category.', 'fussball-sync' ); ?>
+        Eine Zeile je Mannschaft, jede aktive Zeile wird bei jedem Lauf abgeglichen. Mannschaft hinzufügen: letzte leere Zeile ausfüllen und speichern; entfernen: Bezeichnung und Adresse leeren.
+        Die Spiele landen unter „Spiele“ mit der Mannschaft als Zuordnung. „Liga (Anzeige)“ ersetzt bei Ligaspielen den Wettbewerbsnamen von fussball.de, z. B. „Kreisliga B3“ statt „Kreisliga B“. Neue Saison: nur die Adresse auf die neue Saison umstellen.
     </p>
     <?php
 }
@@ -241,12 +237,12 @@ function fussball_sync_field_interval() {
     $value = get_option( 'fussball_sync_interval', 'daily' );
 
     $options = array(
-        'disabled'      => __( 'Disabled (manual only)', 'fussball-sync' ),
-        'hourly'        => __( 'Every hour', 'fussball-sync' ),
-        'every_6_hours' => __( 'Every 6 hours', 'fussball-sync' ),
-        'every_12_hours'=> __( 'Every 12 hours', 'fussball-sync' ),
-        'twicedaily'    => __( 'Twice a day', 'fussball-sync' ),
-        'daily'         => __( 'Once a day (recommended)', 'fussball-sync' ),
+        'disabled'      => 'Aus (nur von Hand)',
+        'hourly'        => 'Stündlich',
+        'every_6_hours' => 'Alle 6 Stunden',
+        'every_12_hours'=> 'Alle 12 Stunden',
+        'twicedaily'    => 'Zweimal täglich',
+        'daily'         => 'Einmal täglich',
     );
 
     echo '<select id="fussball_sync_interval" name="fussball_sync_interval">';
@@ -262,7 +258,7 @@ function fussball_sync_field_interval() {
         echo '<p class="description">'
            . sprintf(
                /* translators: %s = human-readable time */
-               esc_html__( 'Next sync: %s', 'fussball-sync' ),
+               'Nächster Lauf: %s',
                esc_html( human_time_diff( $next, current_time( 'timestamp' ) ) . ' (' . wp_date( 'Y-m-d H:i:s', $next ) . ')' )
              )
            . '</p>';
@@ -274,7 +270,7 @@ function fussball_sync_field_season_start() {
     echo '<input type="date" id="fussball_sync_season_start" name="fussball_sync_season_start"'
        . ' value="' . esc_attr( $value ) . '" />';
     echo '<p class="description">'
-       . esc_html__( 'First day of the current season. Matches from fussball.de dated before this day are ignored during sync. Leave empty for no lower bound.', 'fussball-sync' )
+       . 'Erster Tag der laufenden Saison. Spiele davor ignoriert der Sync. Leer = keine Grenze.'
        . '</p>';
 }
 
@@ -283,7 +279,7 @@ function fussball_sync_field_season_end() {
     echo '<input type="date" id="fussball_sync_season_end" name="fussball_sync_season_end"'
        . ' value="' . esc_attr( $value ) . '" />';
     echo '<p class="description">'
-       . esc_html__( 'Last day of the current season. Matches from fussball.de dated after this day are ignored during sync. Leave empty for no upper bound.', 'fussball-sync' )
+       . 'Letzter Tag der laufenden Saison. Spiele danach ignoriert der Sync. Leer = keine Grenze.'
        . '</p>';
 }
 
@@ -297,36 +293,42 @@ function fussball_sync_settings_page() {
     }
     ?>
     <div class="wrap">
-        <h1><?php esc_html_e( 'Fussball.de Sync', 'fussball-sync' ); ?></h1>
-        <p><?php esc_html_e( 'Automatically sync match results from fussball.de into the Goodlayers Soccer plugin (Fixtures & Results post type).', 'fussball-sync' ); ?></p>
+        <h1>Fussball.de Sync</h1>
+        <p>Holt Spiele und Ergebnisse von fussball.de in den Beitragstyp <a href="<?php echo esc_url( admin_url( 'edit.php?post_type=' . FUSSBALL_SPIEL_PT ) ); ?>">„Spiele“</a>. Version <?php echo esc_html( FUSSBALL_SYNC_VERSION ); ?>.</p>
+        <?php if ( fussball_sync_schema() < 2 ) : ?>
+            <div class="notice notice-warning inline"><p>Die Spiele liegen noch im alten Format von Goodlayers Soccer. Bis zur Umstellung setzt der Sync aus.</p>
+                <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>"><?php wp_nonce_field( 'fussball_sync_migrieren' ); ?><input type="hidden" name="action" value="fussball_sync_migrieren"><p><button class="button button-primary">Jetzt umstellen</button></p></form>
+            </div>
+        <?php endif; ?>
+        <?php if ( isset( $_GET['fussball_migriert'] ) ) : // phpcs:ignore WordPress.Security.NonceVerification ?>
+            <div class="notice notice-success inline"><p><?php echo esc_html( sprintf( 'Umstellung erledigt: %d Spiele.', (int) $_GET['fussball_migriert'] ) ); // phpcs:ignore WordPress.Security.NonceVerification ?></p></div>
+        <?php endif; ?>
 
         <!-- ── Settings form ───────────────────────────────────────────── -->
         <form method="post" action="options.php">
             <?php
             settings_fields( 'fussball_sync_options' );
             do_settings_sections( 'fussball-sync' );
-            submit_button( __( 'Save Settings', 'fussball-sync' ) );
+            submit_button( 'Einstellungen speichern' );
             ?>
         </form>
 
         <!-- ── Manual sync ─────────────────────────────────────────────── -->
         <hr>
-        <h2><?php esc_html_e( 'Manual Sync', 'fussball-sync' ); ?></h2>
-        <p><?php esc_html_e( 'Click the button below to trigger an immediate sync regardless of the schedule.', 'fussball-sync' ); ?></p>
+        <h2>Von Hand abgleichen</h2>
+        <p>Startet sofort einen Abgleich aller aktiven Mannschaften, unabhängig vom Intervall.</p>
 
-        <button id="fussball-sync-run" class="button button-primary">
-            <?php esc_html_e( 'Run Sync Now', 'fussball-sync' ); ?>
-        </button>
+        <button id="fussball-sync-run" class="button button-primary">Jetzt abgleichen</button>
         <span id="fussball-sync-spinner" class="spinner" style="float:none; visibility:hidden; vertical-align:middle; margin-left:4px;"></span>
 
         <div id="fussball-sync-result" style="margin-top:16px; display:none;">
-            <h3><?php esc_html_e( 'Sync Result', 'fussball-sync' ); ?></h3>
+            <h3>Ergebnis</h3>
             <div id="fussball-sync-log" style="font-family:monospace; background:#f5f5f5; border:1px solid #ddd; padding:10px; max-height:300px; overflow-y:auto;"></div>
         </div>
 
         <!-- ── Sync log ────────────────────────────────────────────────── -->
         <hr>
-        <h2><?php esc_html_e( 'Sync Log', 'fussball-sync' ); ?></h2>
+        <h2>Protokoll</h2>
         <?php fussball_sync_render_log(); ?>
 
         <!-- ── Debug info ──────────────────────────────────────────────── -->
@@ -363,7 +365,7 @@ function fussball_sync_settings_page() {
                     $result.show();
                     $log.scrollTop($log[0].scrollHeight);
                 } else {
-                    alert('<?php esc_html_e( 'Sync failed. Check the sync log for details.', 'fussball-sync' ); ?>');
+                    alert('Abgleich fehlgeschlagen. Details im Protokoll.');
                 }
                 // Reload page to refresh the persistent log table
                 setTimeout(function(){ location.reload(); }, 2500);
@@ -382,7 +384,7 @@ function fussball_sync_render_log() {
     $log = get_option( 'fussball_sync_log', array() );
 
     if ( empty( $log ) ) {
-        echo '<p>' . esc_html__( 'No sync runs recorded yet.', 'fussball-sync' ) . '</p>';
+        echo '<p>Noch keine Läufe protokolliert.</p>';
         return;
     }
 
@@ -391,8 +393,8 @@ function fussball_sync_render_log() {
     <table class="widefat striped" style="max-width:900px;">
         <thead>
             <tr>
-                <th style="width:160px;"><?php esc_html_e( 'Time', 'fussball-sync' ); ?></th>
-                <th><?php esc_html_e( 'Message', 'fussball-sync' ); ?></th>
+                <th style="width:160px;">Zeit</th>
+                <th>Meldung</th>
             </tr>
         </thead>
         <tbody>
@@ -406,7 +408,7 @@ function fussball_sync_render_log() {
     </table>
     <p>
         <a href="<?php echo esc_url( wp_nonce_url( add_query_arg( 'fussball_clear_log', '1' ), 'fussball_clear_log' ) ); ?>" class="button button-secondary">
-            <?php esc_html_e( 'Clear Log', 'fussball-sync' ); ?>
+            Protokoll leeren
         </a>
     </p>
     <?php
@@ -416,7 +418,7 @@ function fussball_sync_render_log() {
          && check_admin_referer( 'fussball_clear_log' )
          && current_user_can( 'manage_options' ) ) {
         delete_option( 'fussball_sync_log' );
-        echo '<p class="notice notice-success">' . esc_html__( 'Log cleared.', 'fussball-sync' ) . '</p>';
+        echo '<p class="notice notice-success">Protokoll geleert.</p>';
     }
 }
 
@@ -430,40 +432,50 @@ function fussball_sync_render_debug_info() {
     $next        = wp_next_scheduled( 'fussball_sync_cron_event' );
     ?>
     <hr>
-    <h2><?php esc_html_e( 'Detected Parameters', 'fussball-sync' ); ?></h2>
+    <h2>Erkannte Werte</h2>
     <table class="widefat striped" style="max-width:900px;">
         <thead>
-            <tr>
-                <th><?php esc_html_e( 'Team', 'fussball-sync' ); ?></th>
-                <th><?php esc_html_e( 'Team ID', 'fussball-sync' ); ?></th>
-                <th><?php esc_html_e( 'Season', 'fussball-sync' ); ?></th>
-                <th><?php esc_html_e( 'Categories', 'fussball-sync' ); ?></th>
-                <th><?php esc_html_e( 'Status', 'fussball-sync' ); ?></th>
-            </tr>
+            <tr><th>Mannschaft</th><th>Team-ID</th><th>Saison</th><th>Kürzel</th><th>Spiele</th><th>Status</th></tr>
         </thead>
         <tbody>
         <?php foreach ( $teams as $team ) :
-            $params = fussball_sync_parse_team_url( $team['url'] ); ?>
+            $params = fussball_sync_parse_team_url( $team['url'] );
+            $slug   = fussball_sync_team_slug( $team );
+            $term   = $slug && taxonomy_exists( FUSSBALL_TEAM_TAX ) ? get_term_by( 'slug', $slug, FUSSBALL_TEAM_TAX ) : null; ?>
             <tr>
                 <td><?php echo esc_html( $team['label'] ?: '—' ); ?></td>
                 <td><code><?php echo esc_html( $params ? $params['team_id'] : '?' ); ?></code></td>
                 <td><code><?php echo esc_html( $params ? $params['season'] : '?' ); ?></code></td>
-                <td><code><?php echo esc_html( $team['category'] ?: '—' ); ?></code> / <code><?php echo esc_html( $team['friendly_category'] ?: '—' ); ?></code></td>
-                <td><?php echo ( '1' === (string) $team['enabled'] && $params ) ? esc_html__( 'active', 'fussball-sync' ) : esc_html__( 'inactive', 'fussball-sync' ); ?></td>
+                <td><code><?php echo esc_html( $slug ?: '—' ); ?></code></td>
+                <td><?php echo $term ? '<a href="' . esc_url( admin_url( 'edit.php?post_type=' . FUSSBALL_SPIEL_PT . '&' . FUSSBALL_TEAM_TAX . '=' . $slug ) ) . '">' . (int) $term->count . '</a>' : '0'; ?></td>
+                <td><?php echo ( '1' === (string) $team['enabled'] && $params ) ? 'aktiv' : 'inaktiv'; ?></td>
             </tr>
         <?php endforeach; ?>
         </tbody>
     </table>
     <p>
-        <?php esc_html_e( 'Season date range:', 'fussball-sync' ); ?>
+        Saisonzeitraum:
         <?php if ( empty( $range_start ) && empty( $range_end ) ) : ?>
-            <?php esc_html_e( 'Not set (all matches are synced)', 'fussball-sync' ); ?>
+            nicht gesetzt (alle Spiele)
         <?php else : ?>
             <code><?php echo esc_html( $range_start ?: '…' ); ?></code> – <code><?php echo esc_html( $range_end ?: '…' ); ?></code>
         <?php endif; ?>
         &nbsp;|&nbsp;
-        <?php esc_html_e( 'Next scheduled sync:', 'fussball-sync' ); ?>
-        <?php echo $next ? esc_html( wp_date( 'Y-m-d H:i:s', $next ) ) : esc_html__( 'Not scheduled', 'fussball-sync' ); ?>
+        Nächster geplanter Lauf:
+        <?php echo $next ? esc_html( wp_date( 'Y-m-d H:i:s', $next ) ) : 'nicht geplant'; ?>
     </p>
     <?php
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Umstellung auf 2.0 per Knopf (Einstellungsseite)
+// ──────────────────────────────────────────────────────────────────────────────
+add_action( 'admin_post_fussball_sync_migrieren', function () {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_die( 'Keine Berechtigung' );
+    }
+    check_admin_referer( 'fussball_sync_migrieren' );
+    $r = fussball_sync_migration_v2( false );
+    wp_safe_redirect( add_query_arg( 'fussball_migriert', (int) $r['anzahl'], admin_url( 'options-general.php?page=fussball-sync' ) ) );
+    exit;
+} );
